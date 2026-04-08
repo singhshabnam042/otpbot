@@ -128,6 +128,27 @@ class FiveSimAPI:
         options.sort(key=lambda x: (x["cost"], -x["count"]))
         return options
 
+    def find_cheapest_with_escalation(
+        self,
+        product: str = "google",
+        min_stock: int = config.MIN_STOCK,
+    ) -> tuple[list[dict], int]:
+        """
+        Try finding numbers starting from cheapest price tier.
+        Auto-escalates through PRICE_ESCALATION_STEPS until numbers are found.
+
+        Returns tuple: (options_list, price_tier_used_in_cents)
+        """
+        for price_tier in config.PRICE_ESCALATION_STEPS:
+            options = self.find_cheapest_options(
+                product=product,
+                max_price_cents=price_tier,
+                min_stock=min_stock,
+            )
+            if options:
+                return (options, price_tier)
+        return ([], config.PRICE_ESCALATION_STEPS[-1])
+
     # ─────────────────────────────────────────
     # Order management endpoints
     # ─────────────────────────────────────────
