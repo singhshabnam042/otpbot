@@ -51,6 +51,9 @@ ADMIN_USER_IDS: list[int] = (
     else []
 )
 
+# Price escalation steps in cents (auto-increase if nothing found at MAX_PRICE)
+PRICE_ESCALATION_STEPS: list[int] = [15, 25, 50, 100, 200]
+
 # ─────────────────────────────────────────────
 # 🌐 5sim.net base URL
 # ─────────────────────────────────────────────

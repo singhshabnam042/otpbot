@@ -168,6 +168,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         order_id = int(data.split(":")[1])
         await handle_finish_order(query, context, order_id)
 
+    elif data.startswith("confirm_buy:"):
+        parts = data.split(":")
+        country = parts[1]
+        operator = parts[2]
+        await handle_confirmed_buy(query, context, country, operator)
+
     else:
         await query.edit_message_text("❓ Unknown action. /start se dobara shuru karo.")
 
@@ -198,10 +204,9 @@ async def handle_balance(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_buy(query, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Buy a fresh number and start OTP polling."""
+    """Buy a fresh number and start OTP polling (with auto price escalation)."""
     await query.edit_message_text(
-        "🔍 *Sabse sasta fresh number dhoond raha hu Gmail ke liye...*\n\n"
-        f"💰 Price limit: < ${config.MAX_PRICE/100:.2f}",
+        f"🔍 *${config.MAX_PRICE/100:.2f} mein dhoond raha hu...*",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -224,9 +229,29 @@ async def handle_buy(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Could not check balance before buy: %s", exc)
         # Non-fatal — continue anyway
 
-    # 2. Find cheapest options
+    # 2. Find cheapest options with auto price escalation
+    options: list[dict] = []
+    price_tier_used: int = config.MAX_PRICE
+
     try:
-        options = api.find_cheapest_options()
+        # Walk through escalation steps, showing status to user along the way
+        prev_tier: Optional[int] = None
+        for price_tier in config.PRICE_ESCALATION_STEPS:
+            if prev_tier is not None:
+                await query.edit_message_text(
+                    f"⚠️ *${prev_tier/100:.2f} mein nahi mila, "
+                    f"${price_tier/100:.2f} mein check kar raha hu...*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            found = api.find_cheapest_options(
+                product="google",
+                max_price_cents=price_tier,
+            )
+            if found:
+                options = found
+                price_tier_used = price_tier
+                break
+            prev_tier = price_tier
     except Exception as exc:
         logger.error("Price fetch error: %s", exc)
         await query.edit_message_text(
@@ -239,8 +264,8 @@ async def handle_buy(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not options:
         await query.edit_message_text(
-            f"❌ *Koi number available nahi hai ${config.MAX_PRICE/100:.2f} ke andar!*\n\n"
-            "Thodi der baad try karo ya MAX\\_PRICE badha do.",
+            "❌ *Koi number available nahi hai!*\n\n"
+            "Thodi der baad try karo.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
@@ -248,14 +273,50 @@ async def handle_buy(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # 3. Try buying — auto-retry with next cheapest if needed
+    # 3. If price is above user's original MAX_PRICE, ask for confirmation first
+    if price_tier_used > config.MAX_PRICE:
+        best = options[0]
+        country = best["country"]
+        operator = best["operator"]
+        cost_usd = best["cost"]
+        await query.edit_message_text(
+            f"⚠️ *${config.MAX_PRICE/100:.2f} mein koi number nahi mila.*\n\n"
+            f"💰 Sabse sasta mila:\n"
+            f"{country_flag(country)} *{humanize_country(country)}* — `${cost_usd:.4f}`\n\n"
+            f"⚠️ Ye aapke budget `${config.MAX_PRICE/100:.2f}` se zyada hai.\n\n"
+            "Kya buy karna hai?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Haan, Buy Karo",
+                            callback_data=f"confirm_buy:{country}:{operator}",
+                        ),
+                        InlineKeyboardButton("❌ Nahi, Cancel", callback_data="main_menu"),
+                    ]
+                ]
+            ),
+        )
+        return
+
+    # 4. Within budget — buy directly
+    await _do_buy(query, context, options)
+
+
+async def _do_buy(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    options: list[dict],
+) -> None:
+    """Internal helper: try buying from the given options list (cheapest first)."""
     order: Optional[dict] = None
     tried_countries: list[str] = []
 
     for opt in options[: config.MAX_RETRIES]:
         country = opt["country"]
         operator = opt["operator"]
-        tried_countries.append(f"{humanize_country(country)}")
+        tried_countries.append(humanize_country(country))
         try:
             await query.edit_message_text(
                 f"⏳ Try kar raha hu: {country_flag(country)} *{humanize_country(country)}* "
@@ -275,7 +336,7 @@ async def handle_buy(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not order or not order.get("id"):
         await query.edit_message_text(
-            f"❌ *Number nahi mila* in sab countries try karne ke baad:\n"
+            "❌ *Number nahi mila* in sab countries try karne ke baad:\n"
             + ", ".join(tried_countries)
             + "\n\nThodi der baad dobara try karo.",
             parse_mode=ParseMode.MARKDOWN,
@@ -285,25 +346,23 @@ async def handle_buy(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # 4. Store active order in user context
+    # Store active order in user context
     order_id: int = order["id"]
     phone_raw: str = order.get("phone", "")
     phone_formatted = format_phone_number(phone_raw)
     country_name = humanize_country(order.get("_country", order.get("country", "")))
     cost = order.get("_cost", 0.0)
 
-    # Save active orders per user
     active_orders: dict = context.user_data.get("active_orders", {})
     active_orders[order_id] = {
         "phone": phone_formatted,
         "country": country_name,
         "cost": cost,
-        "sms_seen": [],  # track already-shown OTP codes
+        "sms_seen": [],
         "bought_at": time.time(),
     }
     context.user_data["active_orders"] = active_orders
 
-    # 5. Confirm to user and start polling
     await query.edit_message_text(
         f"✅ *Number mil gaya!*\n\n"
         f"📱 Number: `{phone_formatted}`\n"
@@ -314,7 +373,84 @@ async def handle_buy(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=waiting_keyboard(order_id),
     )
 
-    # 6. Background polling task
+    context.application.create_task(
+        poll_for_otp(
+            chat_id=query.message.chat_id,
+            message_id=query.message.message_id,
+            order_id=order_id,
+            phone=phone_formatted,
+            context=context,
+        )
+    )
+
+
+async def handle_confirmed_buy(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    country: str,
+    operator: str,
+) -> None:
+    """
+    User confirmed buying a number that was above the original MAX_PRICE.
+    Skip price search — directly buy the specific country/operator.
+    """
+    await query.edit_message_text(
+        f"⏳ Try kar raha hu: {country_flag(country)} *{humanize_country(country)}* "
+        f"({operator})...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        order = api.buy_number(country=country, operator=operator)
+    except Exception as exc:
+        logger.error("Confirmed buy failed %s/%s: %s", country, operator, exc)
+        await query.edit_message_text(
+            f"❌ Number kharidne mein error aaya: {exc}\n\nDobara try karo.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+            ),
+        )
+        return
+
+    if not order or not order.get("id"):
+        await query.edit_message_text(
+            "❌ Number nahi mila. Dobara try karo.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+            ),
+        )
+        return
+
+    order["_country"] = country
+    order["_operator"] = operator
+    # cost may not be in the order response directly; use a best-effort fallback
+    order["_cost"] = float(order.get("price", order.get("cost", 0.0)))
+
+    order_id: int = order["id"]
+    phone_raw: str = order.get("phone", "")
+    phone_formatted = format_phone_number(phone_raw)
+    country_name = humanize_country(country)
+    cost = order["_cost"]
+
+    active_orders: dict = context.user_data.get("active_orders", {})
+    active_orders[order_id] = {
+        "phone": phone_formatted,
+        "country": country_name,
+        "cost": cost,
+        "sms_seen": [],
+        "bought_at": time.time(),
+    }
+    context.user_data["active_orders"] = active_orders
+
+    await query.edit_message_text(
+        f"✅ *Number mil gaya!*\n\n"
+        f"📱 Number: `{phone_formatted}`\n"
+        f"{country_flag(country)} Country: *{country_name}*\n"
+        f"💰 Price: `${cost:.4f}`\n\n"
+        f"⏳ OTP ka wait kar raha hu... (max {config.OTP_TIMEOUT}s)",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=waiting_keyboard(order_id),
+    )
+
     context.application.create_task(
         poll_for_otp(
             chat_id=query.message.chat_id,
