@@ -230,28 +230,8 @@ async def handle_buy(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Non-fatal — continue anyway
 
     # 2. Find cheapest options with auto price escalation
-    options: list[dict] = []
-    price_tier_used: int = config.MAX_PRICE
-
     try:
-        # Walk through escalation steps, showing status to user along the way
-        prev_tier: Optional[int] = None
-        for price_tier in config.PRICE_ESCALATION_STEPS:
-            if prev_tier is not None:
-                await query.edit_message_text(
-                    f"⚠️ *${prev_tier/100:.2f} mein nahi mila, "
-                    f"${price_tier/100:.2f} mein check kar raha hu...*",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            found = api.find_cheapest_options(
-                product="google",
-                max_price_cents=price_tier,
-            )
-            if found:
-                options = found
-                price_tier_used = price_tier
-                break
-            prev_tier = price_tier
+        options, price_tier_used = api.find_cheapest_with_escalation()
     except Exception as exc:
         logger.error("Price fetch error: %s", exc)
         await query.edit_message_text(
