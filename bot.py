@@ -402,8 +402,10 @@ async def handle_confirmed_buy(
 
     order["_country"] = country
     order["_operator"] = operator
-    # cost may not be in the order response directly; use a best-effort fallback
-    order["_cost"] = float(order.get("price", order.get("cost", 0.0)))
+    # cost may not be in the order response directly; "price" is the 5sim field name,
+    # "cost" is used elsewhere in this codebase — fall back to 0 if neither present.
+    raw_cost = order.get("price") or order.get("cost") or 0.0
+    order["_cost"] = float(raw_cost)
 
     order_id: int = order["id"]
     phone_raw: str = order.get("phone", "")
